@@ -160,7 +160,7 @@ static const char *const omen_thermal_profile_boards[] = {
 	"878A", "878B", "878C", "87B5", "886B", "886C", "88C8", "88CB",
 	"88D1", "88D2", "88F4", "88F5", "88F6", "88F7", "88FD", "88FE",
 	"88FF", "8900", "8901", "8902", "8912", "8917", "8918", "8949",
-	"894A", "89EB", "8A15", "8A42", "8BAD", "8C77", "8E35", "8E41",
+	"894A", "89EB", "8A15", "8A42", "8BAD", "8E41",
 };
 
 /*
@@ -1869,14 +1869,19 @@ static int victus_s_gpu_thermal_profile_set(bool ctgp_enable,
 	u8 current_dstate, current_gpu_slowdown_temp;
 	int ret;
 
-	/* Read current slowdown temperature so we do not change it */
+	/*
+	 * Read current slowdown temperature so we do not change it.
+	 * If the query fails (e.g. unsupported on some BIOS versions), use
+	 * 0x00 which tells the firmware to use its own default; this is
+	 * preferable to skipping the CTGP/PPAB update entirely.
+	 */
 	ret = victus_s_gpu_thermal_profile_get(&current_ctgp_state,
 					       &current_ppab_state,
 					       &current_dstate,
 					       &current_gpu_slowdown_temp);
 	if (ret < 0) {
-		pr_warn("GPU modes not updated, unable to get slowdown temp\n");
-		return ret;
+		pr_warn("Unable to read GPU slowdown temp (error code: %d), using firmware default\n", ret);
+		current_gpu_slowdown_temp = 0x00;
 	}
 
 	gpu_power_modes.ctgp_enable      = ctgp_enable ? 0x01 : 0x00;
@@ -1951,15 +1956,30 @@ static int platform_profile_victus_s_get_ec(
 						       &current_ppab_state,
 						       &current_dstate,
 						       &current_gpu_slowdown_temp);
-		if (ret < 0)
-			return ret;
+		if (ret < 0) {
+			/*
+			 * WMI 0x21 GET is not available on all boards (e.g.
+			 * OMEN V1 boards that share this code path).  Fall
+			 * back to the cached profile so module init does not
+			 * fail and mode switching keeps working.
+			 */
+			*profile = active_platform_profile;
+			return 0;
+		}
 
 		if (!current_ctgp_state && !current_ppab_state)
 			*profile = PLATFORM_PROFILE_LOW_POWER;
 		else if (!current_ctgp_state && current_ppab_state)
 			*profile = PLATFORM_PROFILE_BALANCED;
 		else
-			return -EINVAL;
+			/*
+			 * ctgp=true with DEFAULT thermal profile is an
+			 * unexpected combination (e.g. left by a previous
+			 * driver version or cold-boot BIOS state).  Treat it
+			 * as BALANCED — the thermal profile IS at the default
+			 * level, so this is the least disruptive fallback.
+			 */
+			*profile = PLATFORM_PROFILE_BALANCED;
 	} else {
 		return -EINVAL;
 	}
@@ -1991,6 +2011,12 @@ static int platform_profile_victus_s_set_ec(
 		break;
 	case PLATFORM_PROFILE_BALANCED:
 		tp               = params->balanced;
+		/*
+		 * CTGP disabled in balanced mode so the GPU runs at base TDP.
+		 * Keeping CTGP=true here would create a state (ctgp=true,
+		 * tp=DEFAULT) that platform_profile_victus_s_get_ec() cannot
+		 * decode and would cause module re-init to fail.
+		 */
 		gpu_ctgp_enable  = false;
 		gpu_ppab_enable  = true;
 		gpu_dstate       = 1;
@@ -2015,10 +2041,13 @@ static int platform_profile_victus_s_set_ec(
 
 	err = victus_s_gpu_thermal_profile_set(gpu_ctgp_enable, gpu_ppab_enable,
 					       gpu_dstate);
-	if (err < 0) {
-		pr_err("Failed to set GPU profile %d: %d\n", profile, err);
-		return err;
-	}
+	if (err < 0)
+		/*
+		 * Non-fatal: the thermal profile (WMI 0x1A) has already been
+		 * applied.  Log a warning but do not propagate the error so
+		 * that the profile switch still takes effect.
+		 */
+		pr_warn("GPU power mode update failed (%d), thermal profile was applied\n", err);
 
 	return 0;
 }
