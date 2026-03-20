@@ -264,11 +264,30 @@ class PowerProfileController:
     TUNED_BUS  = "com.redhat.tuned"
     TUNED_PATH = "/Tuned"
 
+    # Kernel platform_profile sysfs paths in preference order.
+    # kernel <6.10 exposes a single file; kernel ≥6.10 uses a device class.
+    _PP_CANDIDATES = [
+        "/sys/firmware/acpi/platform_profile",
+    ]
+
+    @staticmethod
+    def _find_platform_profile_path():
+        """Return the first usable platform_profile sysfs path, or None."""
+        for path in PowerProfileController._PP_CANDIDATES:
+            if os.path.exists(path):
+                return path
+        # kernel ≥6.10: /sys/class/platform-profile/<name>/profile
+        for path in sorted(glob.glob("/sys/class/platform-profile/*/profile")):
+            if os.path.exists(path):
+                return path
+        return None
+
     def __init__(self):
         self.mode = "ppd"
         self.available = False
         self.bus = SystemBus()
         self.proxy = None
+        self._pp_path = None
 
         try:
             self.proxy = self.bus.get(self.TUNED_BUS, self.TUNED_PATH)
@@ -283,8 +302,16 @@ class PowerProfileController:
                 self.available = True
                 logger.info("PowerProfileController: Using Power-Profiles-Daemon backend")
             except Exception:
-                if os.path.exists("/sys/devices/platform/hp-wmi/thermal_profile") or \
-                   os.path.exists("/sys/devices/platform/hp-omen/thermal_profile"):
+                # Prefer the modern platform_profile sysfs interface (registered by
+                # hp-wmi for OMEN/Victus boards) over the legacy thermal_profile path.
+                pp_path = self._find_platform_profile_path()
+                if pp_path:
+                    self._pp_path = pp_path
+                    self.mode = "platform_profile_direct"
+                    self.available = True
+                    logger.info(f"PowerProfileController: Using platform_profile direct sysfs ({pp_path})")
+                elif os.path.exists("/sys/devices/platform/hp-wmi/thermal_profile") or \
+                     os.path.exists("/sys/devices/platform/hp-omen/thermal_profile"):
                     self.mode = "omen_direct"
                     self.available = True
                     logger.info("PowerProfileController: Using OMEN Direct sysfs backend")
@@ -314,6 +341,11 @@ class PowerProfileController:
                 if "powersave" in tp:   return "power-saver"
                 if "performance" in tp: return "performance"
                 return "balanced"
+            if self.mode == "platform_profile_direct":
+                with open(self._pp_path, "r") as f:
+                    val = f.read().strip()
+                return {"low-power": "power-saver", "balanced": "balanced",
+                        "performance": "performance"}.get(val, "balanced")
             return state.get("power_profile", "balanced")
         except Exception:
             return "balanced"
@@ -331,6 +363,18 @@ class PowerProfileController:
                     "performance": "throughput-performance",
                 }
                 self.proxy.switch_profile(mapping.get(profile, "balanced"))
+            elif self.mode == "platform_profile_direct":
+                # Map daemon profile names to kernel platform_profile values.
+                # "power-saver" → "low-power" (PLATFORM_PROFILE_LOW_POWER)
+                # "balanced"    → "balanced"   (PLATFORM_PROFILE_BALANCED)
+                # "performance" → "performance" (PLATFORM_PROFILE_PERFORMANCE)
+                kernel_val = {
+                    "power-saver": "low-power",
+                    "balanced":    "balanced",
+                    "performance": "performance",
+                }.get(profile, "balanced")
+                with open(self._pp_path, "w") as f:
+                    f.write(kernel_val)
             elif self.mode == "omen_direct":
                 val = {"power-saver": "0", "balanced": "0", "performance": "1"}.get(profile, "0")
                 for path in ("/sys/devices/platform/hp-wmi/thermal_profile",
@@ -347,33 +391,59 @@ class PowerProfileController:
             return False
 
     def _sync_nvidia_power(self, profile):
+        def _parse_watts(raw):
+            """Parse a nvidia-smi power value string to int watts, or 0 on failure."""
+            try:
+                return int(float(raw.strip())) if raw.strip() else 0
+            except (ValueError, AttributeError):
+                return 0
+
         try:
             if not shutil.which("nvidia-smi"):
                 return
 
             if profile == "performance":
-                # Brief delay to allow the BIOS/EC CTGP state change (set by the
-                # thermal profile WMI command) to propagate to the NVIDIA driver
-                # so that power.max_limit reflects the boosted TGP.
-                time.sleep(0.5)
-                out = subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=power.max_limit", "--format=csv,noheader,nounits"],
+                # Poll until power.max_limit rises above power.default_limit,
+                # confirming that the BIOS/EC CTGP state change (triggered by the
+                # thermal profile WMI command) has propagated to the NVIDIA driver.
+                # Try for up to 3 seconds: 12 iterations × 0.25 s = 3 s total.
+                _CTGP_POLL_ITERS = 12
+                _CTGP_POLL_SLEEP = 0.25
+
+                default_out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=power.default_limit",
+                     "--format=csv,noheader,nounits"],
                     timeout=2.0
-                ).decode().strip()
-                if out:
-                    limit = int(float(out))
-                    subprocess.run(["nvidia-smi", "-pl", str(limit)],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
-                    logger.info(f"NVIDIA GPU locked to MAX Performance: {limit}W")
+                ).decode()
+                default_limit = _parse_watts(default_out)
+
+                limit = default_limit
+                for _ in range(_CTGP_POLL_ITERS):
+                    time.sleep(_CTGP_POLL_SLEEP)
+                    out = subprocess.check_output(
+                        ["nvidia-smi", "--query-gpu=power.max_limit",
+                         "--format=csv,noheader,nounits"],
+                        timeout=2.0
+                    ).decode()
+                    limit = _parse_watts(out) or limit
+                    if limit > default_limit:
+                        break  # CTGP has propagated
+
+                subprocess.run(["nvidia-smi", "-pl", str(limit)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=2.0)
+                logger.info(f"NVIDIA GPU locked to MAX Performance: {limit}W")
             else:
                 out = subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=power.default_limit", "--format=csv,noheader,nounits"],
+                    ["nvidia-smi", "--query-gpu=power.default_limit",
+                     "--format=csv,noheader,nounits"],
                     timeout=2.0
-                ).decode().strip()
-                if out:
-                    limit = int(float(out))
+                ).decode()
+                limit = _parse_watts(out)
+                if limit:
                     subprocess.run(["nvidia-smi", "-pl", str(limit)],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=2.0)
                     logger.info(f"NVIDIA GPU restored to DEFAULT Base: {limit}W")
         except Exception as e:
             logger.warning(f"Failed to sync NVIDIA power curve: {e}")
