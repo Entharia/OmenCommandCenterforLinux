@@ -352,6 +352,10 @@ class PowerProfileController:
                 return
 
             if profile == "performance":
+                # Brief delay to allow the BIOS/EC CTGP state change (set by the
+                # thermal profile WMI command) to propagate to the NVIDIA driver
+                # so that power.max_limit reflects the boosted TGP.
+                time.sleep(0.5)
                 out = subprocess.check_output(
                     ["nvidia-smi", "--query-gpu=power.max_limit", "--format=csv,noheader,nounits"],
                     timeout=2.0

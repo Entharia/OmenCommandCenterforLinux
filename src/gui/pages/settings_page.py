@@ -585,9 +585,14 @@ class SettingsPage(Gtk.Box):
                         break
             out.append(f"{name}: {'Found' if found else 'Not Found'}")
 
-        # 3. Platform Profile
-        pp_path = "/sys/firmware/acpi/platform_profile"
-        if os.path.exists(pp_path):
+        # 3. Platform Profile — check both the legacy ACPI path and modern
+        #    platform-profile class paths (kernel 6.10+ uses a device-class
+        #    approach; profile file may live under /sys/class/platform-profile/).
+        _pp_candidates = [
+            "/sys/firmware/acpi/platform_profile",
+        ] + sorted(glob.glob("/sys/class/platform-profile/*/profile"))
+        pp_path = next((p for p in _pp_candidates if os.path.exists(p)), None)
+        if pp_path:
             out.append(f"Platform Profile Path: {pp_path}")
             try:
                 with open(pp_path, "r") as f:
@@ -597,8 +602,8 @@ class SettingsPage(Gtk.Box):
             out.append("Platform Profile: Not Supported")
 
         # 4. Thermal Version (Heuristic)
-        v1_boards = ["8BAB", "8BCD", "8C77", "8E35", "8C78", "8C99", "8C9C", "8D41", "8BBE", "8BD4", "8BD5"] 
-        if board_id in v1_boards or os.path.exists(pp_path):
+        v1_boards = ["8BAB", "8BCD", "8C77", "8E35", "8C78", "8C99", "8C9C", "8D41", "8BBE", "8BD4", "8BD5"]
+        if board_id in v1_boards or pp_path:
             out.append("Thermal Version: 1 (Detected via DMI/Platform Profile)")
         else:
             out.append("Thermal Version: 0 (Legacy or Unknown)")
