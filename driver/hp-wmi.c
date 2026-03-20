@@ -107,34 +107,44 @@ struct thermal_profile_params {
 	u8 balanced;
 	u8 low_power;
 	u8 ec_tp_offset;
+	/*
+	 * Whether CTGP (Configurable TGP) should remain enabled in balanced
+	 * mode.  OMEN boards allow GPU boost even in balanced; pure Victus S
+	 * boards run at base TDP in balanced mode.
+	 */
+	bool ctgp_in_balanced;
 };
 
 static const struct thermal_profile_params victus_s_thermal_params = {
-	.performance  = HP_VICTUS_S_THERMAL_PROFILE_PERFORMANCE,
-	.balanced     = HP_VICTUS_S_THERMAL_PROFILE_DEFAULT,
-	.low_power    = HP_VICTUS_S_THERMAL_PROFILE_DEFAULT,
-	.ec_tp_offset = HP_EC_OFFSET_UNKNOWN,
+	.performance     = HP_VICTUS_S_THERMAL_PROFILE_PERFORMANCE,
+	.balanced        = HP_VICTUS_S_THERMAL_PROFILE_DEFAULT,
+	.low_power       = HP_VICTUS_S_THERMAL_PROFILE_DEFAULT,
+	.ec_tp_offset    = HP_EC_OFFSET_UNKNOWN,
+	.ctgp_in_balanced = false,
 };
 
 static const struct thermal_profile_params omen_v1_thermal_params = {
-	.performance  = HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE,
-	.balanced     = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT,
-	.low_power    = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT,
-	.ec_tp_offset = HP_VICTUS_S_EC_THERMAL_PROFILE_OFFSET,
+	.performance     = HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE,
+	.balanced        = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT,
+	.low_power       = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT,
+	.ec_tp_offset    = HP_VICTUS_S_EC_THERMAL_PROFILE_OFFSET,
+	.ctgp_in_balanced = true,
 };
 
 static const struct thermal_profile_params omen_v1_thermal_params_omen_ec = {
-	.performance  = HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE,
-	.balanced     = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT,
-	.low_power    = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT,
-	.ec_tp_offset = HP_OMEN_EC_THERMAL_PROFILE_OFFSET,
+	.performance     = HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE,
+	.balanced        = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT,
+	.low_power       = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT,
+	.ec_tp_offset    = HP_OMEN_EC_THERMAL_PROFILE_OFFSET,
+	.ctgp_in_balanced = true,
 };
 
 static const struct thermal_profile_params omen_v1_no_ec_thermal_params = {
-	.performance  = HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE,
-	.balanced     = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT,
-	.low_power    = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT,
-	.ec_tp_offset = HP_NO_THERMAL_PROFILE_OFFSET,
+	.performance     = HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE,
+	.balanced        = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT,
+	.low_power       = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT,
+	.ec_tp_offset    = HP_NO_THERMAL_PROFILE_OFFSET,
+	.ctgp_in_balanced = true,
 };
 
 /*
@@ -1991,7 +2001,13 @@ static int platform_profile_victus_s_set_ec(
 		break;
 	case PLATFORM_PROFILE_BALANCED:
 		tp               = params->balanced;
-		gpu_ctgp_enable  = false;
+		/*
+		 * OMEN V1 boards keep CTGP enabled in balanced mode so that
+		 * the GPU can still boost above base TDP, matching Windows
+		 * OMEN Command Center behaviour.  Pure Victus S boards run
+		 * at base TDP in balanced mode.
+		 */
+		gpu_ctgp_enable  = params->ctgp_in_balanced;
 		gpu_ppab_enable  = true;
 		gpu_dstate       = 1;
 		break;
@@ -2015,10 +2031,13 @@ static int platform_profile_victus_s_set_ec(
 
 	err = victus_s_gpu_thermal_profile_set(gpu_ctgp_enable, gpu_ppab_enable,
 					       gpu_dstate);
-	if (err < 0) {
-		pr_err("Failed to set GPU profile %d: %d\n", profile, err);
-		return err;
-	}
+	if (err < 0)
+		/*
+		 * Non-fatal: the thermal profile (WMI 0x1A) has already been
+		 * applied.  Log a warning but do not propagate the error so
+		 * that the profile switch still takes effect.
+		 */
+		pr_warn("GPU power mode update failed (%d), thermal profile was applied\n", err);
 
 	return 0;
 }
